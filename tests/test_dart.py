@@ -588,9 +588,11 @@ class TestDart(unittest.TestCase):
         nodes = result["nodes"]
         edges = result["edges"]
 
-        # A. Bug D redirect: No child file node should be created in nodes
+        # A. Bug D redirect: the part keeps its own file node (so it can be looked
+        # up by name), but its symbols are redirected to the parent library below.
         child_node = next((n for n in nodes if n["label"] == "child_part.dart"), None)
-        self.assertIsNone(child_node)
+        self.assertIsNotNone(child_node)
+        self.assertEqual(child_node["id"], _make_id(str(child_file)))
 
         # B. Check that defines edge source is parent file ID
         parent_fid = _make_id(str(parent_file.resolve()))
@@ -732,28 +734,355 @@ class TestDart(unittest.TestCase):
 
     def test_missing_grammar_reports_error(self):
         """Match other tree-sitter extractors when the grammar package is absent."""
+        from unittest import mock
+
         import graphify.extractors.dart as dart_mod
-
-        real_import = __import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "tree_sitter_dart" or name.startswith("tree_sitter_dart"):
-                raise ImportError("blocked for test")
-            return real_import(name, *args, **kwargs)
 
         path = self.temp_path / "x.dart"
         path.write_text("class A {}", encoding="utf-8")
-        # Patch via builtins so the extractor's import fails
-        import builtins
-
-        original = builtins.__import__
-        builtins.__import__ = fake_import
-        try:
+        # A None entry in sys.modules makes `import tree_sitter_dart` raise ImportError.
+        with mock.patch.dict(sys.modules, {"tree_sitter_dart": None}):
             result = dart_mod.extract_dart(path)
-        finally:
-            builtins.__import__ = original
         self.assertEqual(result.get("error"), "tree-sitter-dart not installed")
 
+    def _extract(self, name: str, code: str) -> tuple[dict, dict]:
+        path = self.temp_path / name
+        path.write_text(textwrap.dedent(code), encoding="utf-8")
+        result = extract_dart(path)
+        self.assertNotIn("error", result)
+        return result, {n["id"]: n["label"] for n in result["nodes"]}
+
+    def _edges(self, result: dict, labels: dict, relation: str, context: object = ...) -> set:
+        return {
+            (labels.get(e["source"], e["source"]), labels.get(e["target"], e["target"]))
+            for e in result["edges"]
+            if e["relation"] == relation and (context is ... or e.get("context") == context)
+        }
+
+    def test_abstract_members_are_extracted(self):
+        """A bodiless member of an interface / abstract class is a member node."""
+        result, labels = self._extract("nav.dart", """
+            abstract class LoginNavigator {
+              Future<bool> openLogin();
+              int get count;
+            }
+            """)
+        members = self._edges(result, labels, "defines")
+        self.assertIn(("LoginNavigator", "openLogin"), members)
+        self.assertIn(("LoginNavigator", "count"), members)
+
+    def test_static_class_fields_are_extracted(self):
+        """`static const` / `static final` class fields are member nodes."""
+        result, labels = self._extract("icons.dart", """
+            class AppIcons {
+              static const _family = 'AppIcons';
+              static final IconData wifi = IconData(1), bolt = IconData(2);
+            }
+            """)
+        members = self._edges(result, labels, "defines")
+        for field in ("_family", "wifi", "bolt"):
+            self.assertIn(("AppIcons", field), members)
+        self.assertIn(("icons.dart", "IconData"), self._edges(result, labels, "references", "variable_type"))
+
+    def test_legacy_function_typedef_is_named_by_its_alias(self):
+        """`typedef int Cmp(...)`: the alias is Cmp; int is its return type."""
+        result, labels = self._extract("cmp.dart", """
+            typedef int Compare(Object a, Object b);
+            typedef T Id<T>(T x);
+            typedef Callback = Result Function(int);
+            typedef JsonMap = p.Payload<String>;
+            """)
+        defined = {t for s, t in self._edges(result, labels, "defines") if s == "cmp.dart"}
+        self.assertEqual(defined, {"Compare", "Id", "Callback", "JsonMap"})
+        # Only the plain named alias references its type; a function type's
+        # leading name is its return type.
+        self.assertEqual(self._edges(result, labels, "references", "typedef"), {("JsonMap", "Payload")})
+
+    def test_supertype_generic_arguments_are_not_supertypes(self):
+        """`implements Cmp<Foo>` implements Cmp only; `with M<X>` mixes in M only."""
+        result, labels = self._extract("impl.dart", """
+            class Item extends Base<Payload> with Tracked<Item>, Logged implements Comparable<Item>, p.Codec<Item> {}
+            """)
+        self.assertEqual(self._edges(result, labels, "implements"), {("Item", "Comparable"), ("Item", "p.Codec")})
+        self.assertEqual(self._edges(result, labels, "mixes_in"), {("Item", "Tracked"), ("Item", "Logged")})
+        self.assertEqual(self._edges(result, labels, "inherits"), {("Item", "Base")})
+        # The superclass's own generic arguments are still references.
+        self.assertIn(("Item", "Payload"), self._edges(result, labels, "references"))
+
+    def test_top_level_getter_and_enum_members(self):
+        result, labels = self._extract("misc.dart", """
+            int get answer => 42;
+            enum Color { red, green; String label() => name; }
+            """)
+        self.assertIn(("misc.dart", "answer"), self._edges(result, labels, "defines"))
+        self.assertIn(("Color", "label"), self._edges(result, labels, "defines"))
+
+    def test_heuristics_ignore_comments(self):
+        """A commented-out emit / route is not an edge; a real one still is."""
+        result, labels = self._extract("bloc.dart", """
+            class CounterBloc extends Bloc<CounterEvent, CounterState> {
+              void f() {
+                // emit(Loading());  context.push('/old');
+                /* emit(Ghost()); */
+                emit(Ready());
+                context.push('/home');
+              }
+            }
+            """)
+        emitted = {t for _, t in self._edges(result, labels, "calls", "emit_state")}
+        self.assertEqual(emitted, {"Ready"})
+        routes = {t for _, t in self._edges(result, labels, "navigates", "route_path")}
+        self.assertEqual(routes, {"Route /home"})
+
+    def test_type_lookup_emitted_once_per_call_site(self):
+        result, _ = self._extract("di.dart", """
+            class W {
+              void tap() { getIt<AuthService>(); }
+            }
+            """)
+        lookups = [e for e in result["edges"] if e.get("context") == "type_lookup"]
+        self.assertEqual(len(lookups), 1)
+
+    def test_calls_are_found_in_every_position(self):
+        """Arrow bodies, initializers, conditions, arguments and closures."""
+        result, labels = self._extract("calls.dart", """
+            String helper() => 'x';
+            int load() => 1;
+            bool check() => true;
+            void doThing() {}
+            void run(void Function() cb) => cb();
+            String arrow() => helper();
+            void f() {
+              final x = load();
+              if (check()) {}
+              run(() { doThing(); });
+            }
+            """)
+        calls = self._edges(result, labels, "calls", "call")
+        self.assertIn(("arrow", "helper"), calls)
+        for callee in ("load", "check", "run", "doThing"):
+            self.assertIn(("f", callee), calls)
+
+    def test_ambiguous_member_call_is_not_bound(self):
+        """Two same-file `build` methods: a receiver call binds to neither, while
+        a bare call inside a member binds to the caller's own type."""
+        result, _ = self._extract("widgets.dart", """
+            class A {
+              Widget build(BuildContext c) { return helper(); }
+              Widget helper() => Text('');
+            }
+            class B {
+              Widget build(BuildContext c) { return helper(); }
+              Widget helper() => Text('');
+            }
+            void main() { A().build(ctx); }
+            """)
+        stem = _file_stem(self.temp_path / "widgets.dart")
+        calls = {
+            (e["source"], e["target"]) for e in result["edges"]
+            if e["relation"] == "calls" and e.get("context") == "call"
+        }
+        a_build, a_helper = _make_id(stem, "A", "build"), _make_id(stem, "A", "helper")
+        b_build, b_helper = _make_id(stem, "B", "build"), _make_id(stem, "B", "helper")
+        self.assertIn((a_build, a_helper), calls)
+        self.assertIn((b_build, b_helper), calls)
+        self.assertNotIn((a_build, b_helper), calls)
+        self.assertNotIn((b_build, a_helper), calls)
+        main = _make_id(stem, "main")
+        self.assertFalse({t for s, t in calls if s == main} & {a_build, b_build})
+
+    def test_underscore_and_dollar_names_do_not_collide(self):
+        """`_make_id` drops `_`/`$`: freezed's `mixin _$Vm` / `class _Vm` and a
+        field `_items` / getter `items` must still be four distinct nodes, and a
+        unique public name keeps the plain id."""
+        result, labels = self._extract("vm.dart", """
+            mixin _$AuthVm {}
+            class _AuthVm with _$AuthVm {
+              _AuthVm(this._items);
+              final List<String> _items;
+              List<String> get items => _items;
+            }
+            """)
+        by_label = {}  # local declarations only; `with _$AuthVm` also mints a sourceless stub
+        for n in result["nodes"]:
+            if n.get("source_file"):
+                by_label.setdefault(n["label"], []).append(n["id"])
+        for label in ("_$AuthVm", "_AuthVm", "_items", "items"):
+            self.assertEqual(len(by_label.get(label, [])), 1, label)
+        ids = {by_label[label][0] for label in ("_$AuthVm", "_AuthVm", "_items", "items")}
+        self.assertEqual(len(ids), 4)
+        class_nid = by_label["_AuthVm"][0]
+        self.assertEqual(by_label["items"][0], _make_id(class_nid, "items"))
+        self.assertIn(("_AuthVm", "_$AuthVm"), self._edges(result, labels, "mixes_in"))
+
+
+    def test_part_file_keeps_its_own_node(self):
+        """A `part of` file is a real source file: it must be findable by name and
+        linked to its library and its declarations, while those declarations keep
+        the library's id namespace (Bug D redirect)."""
+        lib_file = self.temp_path / "settlement.dart"
+        lib_file.write_text("part 'derive.dart';\n\nclass Settlement {}\n", encoding="utf-8")
+        part_file = self.temp_path / "derive.dart"
+        part_file.write_text(textwrap.dedent("""\
+            part of 'settlement.dart';
+
+            class DeriveHelper {}
+
+            void deriveAll() {}
+            """), encoding="utf-8")
+
+        result = extract_dart(part_file)
+        lib_nid = _make_id(str(lib_file.resolve()))
+        part_nid = _make_id(str(part_file))
+
+        part_node = next(n for n in result["nodes"] if n["id"] == part_nid)
+        self.assertEqual(part_node["label"], "derive.dart")
+        self.assertEqual(part_node["source_file"], str(part_file))
+
+        includes = [e for e in result["edges"] if e["relation"] == "includes"]
+        self.assertEqual([(e["source"], e["target"]) for e in includes], [(lib_nid, part_nid)])
+        self.assertEqual(includes[0]["source_location"], "L1")
+
+        defined = {e["target"] for e in result["edges"]
+                   if e["source"] == lib_nid and e["relation"] == "defines"}
+        contained = {e["target"] for e in result["edges"]
+                     if e["source"] == part_nid and e["relation"] == "contains"}
+        labels = {n["id"]: n["label"] for n in result["nodes"]}
+        self.assertEqual({labels[t] for t in defined}, {"DeriveHelper", "deriveAll"})
+        self.assertEqual(contained, defined)
+        # Ids stay in the library's namespace: nothing is minted under the part's stem.
+        part_stem = _make_id(_file_stem(part_file))
+        for nid in defined:
+            self.assertFalse(nid.startswith(part_stem + "_"), nid)
+
+    def test_conditional_uris_emit_every_branch(self):
+        """A configurable export/import must link every platform branch, not only
+        the default URI; a string literal inside the condition is not a URI."""
+        code = textwrap.dedent("""\
+        import 'conn_stub.dart'
+            if (dart.library.io) 'conn_io.dart'
+            if (dart.library.js_interop) 'conn_web.dart';
+        import 'flags.dart' if (app.flavor == 'prod') 'flags_prod.dart';
+        export 'service_stub.dart' if (dart.library.io) "service_io.dart";
+        """)
+        path = self.temp_path / "facade.dart"
+        path.write_text(code, encoding="utf-8")
+        result = extract_dart(path)
+        file_nid = _make_id(str(path))
+
+        def targets(relation, context):
+            return {
+                e["target"]
+                for e in result["edges"]
+                if e["source"] == file_nid
+                and e["relation"] == relation
+                and e.get("context") == context
+            }
+
+        self.assertEqual(targets("imports", None), {_make_id("conn_stub.dart"), _make_id("flags.dart")})
+        self.assertEqual(
+            targets("imports", "conditional_uri"),
+            {_make_id("conn_io.dart"), _make_id("conn_web.dart"), _make_id("flags_prod.dart")},
+        )
+        self.assertEqual(targets("exports", None), {_make_id("service_stub.dart")})
+        self.assertEqual(targets("exports", "conditional_uri"), {_make_id("service_io.dart")})
+        labels = {n["label"] for n in result["nodes"]}
+        self.assertNotIn("prod", labels)
+        loc = {
+            e["target"]: e["source_location"]
+            for e in result["edges"]
+            if e["relation"] in ("imports", "exports")
+        }
+        self.assertEqual(loc[_make_id("conn_web.dart")], "L3")
+        self.assertEqual(loc[_make_id("service_io.dart")], "L5")
+
+    def test_anonymous_extension_is_detected(self):
+        """An unnamed `extension on Type { ... }` must mint a node and an
+        `extends` edge, exactly like a named extension does; the fallback
+        label it already carried for this case never actually matched."""
+        code = textwrap.dedent("""
+        extension on String {
+          String shout() => toUpperCase();
+        }
+        """)
+        path = self.temp_path / "shout.dart"
+        path.write_text(code, encoding="utf-8")
+        result = extract_dart(path)
+
+        ext_node = next((n for n in result["nodes"] if n["label"] == "Extension on String"), None)
+        self.assertIsNotNone(ext_node)
+
+        extends_string = next(
+            (e for e in result["edges"] if e["source"] == ext_node["id"] and e["relation"] == "extends"),
+            None,
+        )
+        self.assertIsNotNone(extends_string)
+        self.assertEqual(extends_string["target"], "string")
+
+    def test_named_extension_is_unaffected(self):
+        """A control for the fix above: a named extension must still resolve
+        exactly as before, not fall into the anonymous-fallback label."""
+        code = textwrap.dedent("""
+        extension StringExtensions on String {
+          String whisper() => toLowerCase();
+        }
+        """)
+        path = self.temp_path / "whisper.dart"
+        path.write_text(code, encoding="utf-8")
+        result = extract_dart(path)
+
+        ext_node = next((n for n in result["nodes"] if n["label"] == "StringExtensions"), None)
+        self.assertIsNotNone(ext_node)
+        self.assertIsNone(next((n for n in result["nodes"] if "anonymous_extension" in n["id"]), None))
+
+    def test_mixin_on_clause_with_multiple_superclass_constraints(self):
+        """A mixin's `on` clause may list several superclass constraints,
+        comma-separated (`mixin Foo on A, B {}`); every one of them must get
+        an `inherits` edge, not just the first."""
+        code = textwrap.dedent("""
+        mixin Selectable on Comparable<Selectable>, State<WidgetState> {
+          void select() {}
+        }
+        """)
+        path = self.temp_path / "selectable.dart"
+        path.write_text(code, encoding="utf-8")
+        result = extract_dart(path)
+
+        mixin_node = next((n for n in result["nodes"] if n["label"] == "Selectable"), None)
+        self.assertIsNotNone(mixin_node)
+
+        inherits_targets = {
+            e["target"] for e in result["edges"]
+            if e["source"] == mixin_node["id"] and e["relation"] == "inherits"
+        }
+        self.assertEqual(inherits_targets, {"comparable", "state"})
+
+        # The generic argument of the dropped second constraint must still
+        # surface as a reference, exactly like the first constraint's does.
+        ref_targets = {
+            e["target"] for e in result["edges"]
+            if e["source"] == mixin_node["id"] and e["relation"] == "references"
+        }
+        self.assertIn("widgetstate", ref_targets)
+
+    def test_mixin_on_clause_with_single_superclass_constraint_is_unaffected(self):
+        """A control for the fix above: a mixin with only one `on` superclass
+        constraint must still resolve exactly as before."""
+        code = textwrap.dedent("""
+        mixin AuthMixin on BaseWidget {}
+        """)
+        path = self.temp_path / "auth_mixin.dart"
+        path.write_text(code, encoding="utf-8")
+        result = extract_dart(path)
+
+        mixin_node = next((n for n in result["nodes"] if n["label"] == "AuthMixin"), None)
+        self.assertIsNotNone(mixin_node)
+
+        inherits = [
+            e for e in result["edges"]
+            if e["source"] == mixin_node["id"] and e["relation"] == "inherits"
+        ]
+        self.assertEqual([e["target"] for e in inherits], ["basewidget"])
 
 if __name__ == "__main__":
     unittest.main()

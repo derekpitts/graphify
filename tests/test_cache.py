@@ -1,4 +1,5 @@
 """Tests for graphify/cache.py."""
+import os
 import pytest
 from pathlib import Path
 from graphify.cache import file_hash, cache_dir, load_cached, save_cached, cached_files, clear_cache, _body_content
@@ -639,6 +640,38 @@ def test_ast_cache_schema_rejects_same_version_legacy_collision(
     assert not old_dir.exists()
 
 
+def test_python_receiver_shadow_schema_retires_same_version_raw_calls(
+    tmp_path, monkeypatch,
+):
+    """Schema-4 raw calls lack the lexical fact required by external resolution."""
+    import graphify.cache as cache_mod
+    from graphify.extract import extract
+
+    target = tmp_path / "caller.py"
+    target.write_text("import requests\n\ndef fetch():\n    return requests.get('/data')\n")
+    monkeypatch.setattr(cache_mod, "_EXTRACTOR_VERSION", "same-version")
+    monkeypatch.setattr(cache_mod, "_AST_CACHE_SCHEMA", 4)
+    monkeypatch.setattr(cache_mod, "_cleaned_ast_dirs", set())
+    save_cached(target, {"nodes": [], "edges": [], "raw_calls": [
+        {"caller_nid": "old", "receiver": "requests", "callee": "get"}
+    ]}, root=tmp_path, kind="ast")
+    old_dir = cache_dir(tmp_path, "ast")
+
+    monkeypatch.setattr(cache_mod, "_AST_CACHE_SCHEMA", 5)
+    assert load_cached(target, root=tmp_path, kind="ast") is None
+    assert not old_dir.exists()
+    cold = extract([target], cache_root=tmp_path, root=tmp_path)
+    fresh = load_cached(target, root=tmp_path, kind="ast")
+    assert fresh is not None
+    assert any(rc.get("_python_receiver_shadowed") is False
+               for rc in fresh.get("raw_calls", []))
+    warm = extract([target], cache_root=tmp_path, root=tmp_path)
+    assert len([e for e in cold["edges"] if e["relation"] == "calls"]) == 1
+    assert [e for e in cold["edges"] if e["relation"] == "calls"] == [
+        e for e in warm["edges"] if e["relation"] == "calls"
+    ]
+
+
 def test_ast_cache_version_bump_cleans_stale_entries(tmp_path, monkeypatch):
     """Upgrading removes AST entries left behind by previous versions so the
     cache directory does not grow one full copy per release."""
@@ -817,6 +850,27 @@ def test_warm_cache_keeps_target_and_symlink_sources_distinct(
     assert warm_counts == cold_counts
     assert len(cold_counts) == 2
     assert {Path(source).name for source in cold_counts} == {"real.py", "link.py"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows-only")
+def test_file_hash_distinguishes_walked_junction_paths(tmp_path):
+    r"""#2832 with junctions, which need no symlink privilege. Under a junctioned
+    scan root the walked-parent match compared a plain spelling with the
+    ``\\?\`` form of the root (#4925), never matched, and the in-root alias fell
+    back to its target's salt and shared its digest."""
+    import subprocess
+
+    _reset_stat_index()
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    target = root / "sub" / "g.py"
+    target.write_text("def g():\n    return 1\n")
+    for link, dest in ((root / "alias", root / "sub"), (tmp_path / "scan", root)):
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(dest)],
+                       check=True, capture_output=True)
+
+    walked_alias = tmp_path / "scan" / "alias" / "g.py"
+    assert file_hash(walked_alias, root) != file_hash(target, root)
 
 
 def test_semantic_cache_self_heals_legacy_symlink_collision(

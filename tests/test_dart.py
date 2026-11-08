@@ -734,27 +734,186 @@ class TestDart(unittest.TestCase):
 
     def test_missing_grammar_reports_error(self):
         """Match other tree-sitter extractors when the grammar package is absent."""
+        from unittest import mock
+
         import graphify.extractors.dart as dart_mod
-
-        real_import = __import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "tree_sitter_dart" or name.startswith("tree_sitter_dart"):
-                raise ImportError("blocked for test")
-            return real_import(name, *args, **kwargs)
 
         path = self.temp_path / "x.dart"
         path.write_text("class A {}", encoding="utf-8")
-        # Patch via builtins so the extractor's import fails
-        import builtins
-
-        original = builtins.__import__
-        builtins.__import__ = fake_import
-        try:
+        # A None entry in sys.modules makes `import tree_sitter_dart` raise ImportError.
+        with mock.patch.dict(sys.modules, {"tree_sitter_dart": None}):
             result = dart_mod.extract_dart(path)
-        finally:
-            builtins.__import__ = original
         self.assertEqual(result.get("error"), "tree-sitter-dart not installed")
+
+    def _extract(self, name: str, code: str) -> tuple[dict, dict]:
+        path = self.temp_path / name
+        path.write_text(textwrap.dedent(code), encoding="utf-8")
+        result = extract_dart(path)
+        self.assertNotIn("error", result)
+        return result, {n["id"]: n["label"] for n in result["nodes"]}
+
+    def _edges(self, result: dict, labels: dict, relation: str, context: object = ...) -> set:
+        return {
+            (labels.get(e["source"], e["source"]), labels.get(e["target"], e["target"]))
+            for e in result["edges"]
+            if e["relation"] == relation and (context is ... or e.get("context") == context)
+        }
+
+    def test_abstract_members_are_extracted(self):
+        """A bodiless member of an interface / abstract class is a member node."""
+        result, labels = self._extract("nav.dart", """
+            abstract class LoginNavigator {
+              Future<bool> openLogin();
+              int get count;
+            }
+            """)
+        members = self._edges(result, labels, "defines")
+        self.assertIn(("LoginNavigator", "openLogin"), members)
+        self.assertIn(("LoginNavigator", "count"), members)
+
+    def test_static_class_fields_are_extracted(self):
+        """`static const` / `static final` class fields are member nodes."""
+        result, labels = self._extract("icons.dart", """
+            class AppIcons {
+              static const _family = 'AppIcons';
+              static final IconData wifi = IconData(1), bolt = IconData(2);
+            }
+            """)
+        members = self._edges(result, labels, "defines")
+        for field in ("_family", "wifi", "bolt"):
+            self.assertIn(("AppIcons", field), members)
+        self.assertIn(("icons.dart", "IconData"), self._edges(result, labels, "references", "variable_type"))
+
+    def test_legacy_function_typedef_is_named_by_its_alias(self):
+        """`typedef int Cmp(...)`: the alias is Cmp; int is its return type."""
+        result, labels = self._extract("cmp.dart", """
+            typedef int Compare(Object a, Object b);
+            typedef T Id<T>(T x);
+            typedef Callback = Result Function(int);
+            typedef JsonMap = p.Payload<String>;
+            """)
+        defined = {t for s, t in self._edges(result, labels, "defines") if s == "cmp.dart"}
+        self.assertEqual(defined, {"Compare", "Id", "Callback", "JsonMap"})
+        # Only the plain named alias references its type; a function type's
+        # leading name is its return type.
+        self.assertEqual(self._edges(result, labels, "references", "typedef"), {("JsonMap", "Payload")})
+
+    def test_supertype_generic_arguments_are_not_supertypes(self):
+        """`implements Cmp<Foo>` implements Cmp only; `with M<X>` mixes in M only."""
+        result, labels = self._extract("impl.dart", """
+            class Item extends Base<Payload> with Tracked<Item>, Logged implements Comparable<Item>, p.Codec<Item> {}
+            """)
+        self.assertEqual(self._edges(result, labels, "implements"), {("Item", "Comparable"), ("Item", "p.Codec")})
+        self.assertEqual(self._edges(result, labels, "mixes_in"), {("Item", "Tracked"), ("Item", "Logged")})
+        self.assertEqual(self._edges(result, labels, "inherits"), {("Item", "Base")})
+        # The superclass's own generic arguments are still references.
+        self.assertIn(("Item", "Payload"), self._edges(result, labels, "references"))
+
+    def test_top_level_getter_and_enum_members(self):
+        result, labels = self._extract("misc.dart", """
+            int get answer => 42;
+            enum Color { red, green; String label() => name; }
+            """)
+        self.assertIn(("misc.dart", "answer"), self._edges(result, labels, "defines"))
+        self.assertIn(("Color", "label"), self._edges(result, labels, "defines"))
+
+    def test_heuristics_ignore_comments(self):
+        """A commented-out emit / route is not an edge; a real one still is."""
+        result, labels = self._extract("bloc.dart", """
+            class CounterBloc extends Bloc<CounterEvent, CounterState> {
+              void f() {
+                // emit(Loading());  context.push('/old');
+                /* emit(Ghost()); */
+                emit(Ready());
+                context.push('/home');
+              }
+            }
+            """)
+        emitted = {t for _, t in self._edges(result, labels, "calls", "emit_state")}
+        self.assertEqual(emitted, {"Ready"})
+        routes = {t for _, t in self._edges(result, labels, "navigates", "route_path")}
+        self.assertEqual(routes, {"Route /home"})
+
+    def test_type_lookup_emitted_once_per_call_site(self):
+        result, _ = self._extract("di.dart", """
+            class W {
+              void tap() { getIt<AuthService>(); }
+            }
+            """)
+        lookups = [e for e in result["edges"] if e.get("context") == "type_lookup"]
+        self.assertEqual(len(lookups), 1)
+
+    def test_calls_are_found_in_every_position(self):
+        """Arrow bodies, initializers, conditions, arguments and closures."""
+        result, labels = self._extract("calls.dart", """
+            String helper() => 'x';
+            int load() => 1;
+            bool check() => true;
+            void doThing() {}
+            void run(void Function() cb) => cb();
+            String arrow() => helper();
+            void f() {
+              final x = load();
+              if (check()) {}
+              run(() { doThing(); });
+            }
+            """)
+        calls = self._edges(result, labels, "calls", "call")
+        self.assertIn(("arrow", "helper"), calls)
+        for callee in ("load", "check", "run", "doThing"):
+            self.assertIn(("f", callee), calls)
+
+    def test_ambiguous_member_call_is_not_bound(self):
+        """Two same-file `build` methods: a receiver call binds to neither, while
+        a bare call inside a member binds to the caller's own type."""
+        result, _ = self._extract("widgets.dart", """
+            class A {
+              Widget build(BuildContext c) { return helper(); }
+              Widget helper() => Text('');
+            }
+            class B {
+              Widget build(BuildContext c) { return helper(); }
+              Widget helper() => Text('');
+            }
+            void main() { A().build(ctx); }
+            """)
+        stem = _file_stem(self.temp_path / "widgets.dart")
+        calls = {
+            (e["source"], e["target"]) for e in result["edges"]
+            if e["relation"] == "calls" and e.get("context") == "call"
+        }
+        a_build, a_helper = _make_id(stem, "A", "build"), _make_id(stem, "A", "helper")
+        b_build, b_helper = _make_id(stem, "B", "build"), _make_id(stem, "B", "helper")
+        self.assertIn((a_build, a_helper), calls)
+        self.assertIn((b_build, b_helper), calls)
+        self.assertNotIn((a_build, b_helper), calls)
+        self.assertNotIn((b_build, a_helper), calls)
+        main = _make_id(stem, "main")
+        self.assertFalse({t for s, t in calls if s == main} & {a_build, b_build})
+
+    def test_underscore_and_dollar_names_do_not_collide(self):
+        """`_make_id` drops `_`/`$`: freezed's `mixin _$Vm` / `class _Vm` and a
+        field `_items` / getter `items` must still be four distinct nodes, and a
+        unique public name keeps the plain id."""
+        result, labels = self._extract("vm.dart", """
+            mixin _$AuthVm {}
+            class _AuthVm with _$AuthVm {
+              _AuthVm(this._items);
+              final List<String> _items;
+              List<String> get items => _items;
+            }
+            """)
+        by_label = {}  # local declarations only; `with _$AuthVm` also mints a sourceless stub
+        for n in result["nodes"]:
+            if n.get("source_file"):
+                by_label.setdefault(n["label"], []).append(n["id"])
+        for label in ("_$AuthVm", "_AuthVm", "_items", "items"):
+            self.assertEqual(len(by_label.get(label, [])), 1, label)
+        ids = {by_label[label][0] for label in ("_$AuthVm", "_AuthVm", "_items", "items")}
+        self.assertEqual(len(ids), 4)
+        class_nid = by_label["_AuthVm"][0]
+        self.assertEqual(by_label["items"][0], _make_id(class_nid, "items"))
+        self.assertIn(("_AuthVm", "_$AuthVm"), self._edges(result, labels, "mixes_in"))
 
 
     def test_part_file_keeps_its_own_node(self):

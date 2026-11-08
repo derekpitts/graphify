@@ -4,7 +4,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
+from graphify.extractors.base import (
+    _LANGUAGE_BUILTIN_GLOBALS,
+    _file_stem,
+    _make_id,
+    _read_source_bytes,
+    _read_text,
+)
 
 _DART_BUILTIN_TYPES = frozenset({
     "String", "int", "double", "bool", "num", "dynamic", "Object", "void",
@@ -12,15 +18,38 @@ _DART_BUILTIN_TYPES = frozenset({
     "Null", "Never", "Function", "Record", "Symbol", "Type",
 })
 
+# Annotations that carry no architecture signal. The compiler hints at the end
+# (`@pragma`, `@optionalTypeArgs`, `@useResult`) sit on nearly every member of
+# generated freezed / json_serializable code and would otherwise turn into hub
+# nodes with thousands of `configures` edges.
 _ANNOTATION_SKIP = frozenset({
     "override", "deprecated", "required", "protected", "mustCallSuper",
     "visibleForTesting", "immutable", "nonVirtual", "mustBeOverridden",
+    "pragma", "optionalTypeArgs", "useResult",
 })
 
 _METHOD_NAME_SKIP = frozenset({
     "if", "for", "while", "switch", "catch", "return", "void", "dynamic",
     "final", "const", "get", "set", "var", "late", "typedef", "factory",
 })
+
+_MEMBER_SIGNATURES = ("function_signature", "getter_signature", "setter_signature")
+
+_CTOR_SIGNATURES = (
+    "constructor_signature",
+    "constant_constructor_signature",
+    "factory_constructor_signature",
+    "redirecting_factory_constructor_signature",
+)
+
+_TYPE_DECLS = (
+    "class_definition",
+    "mixin_declaration",
+    "enum_declaration",
+    "extension_declaration",
+    "extension_type_declaration",
+    "type_alias",
+)
 
 
 def _line_of(node) -> int:
@@ -38,95 +67,151 @@ def _type_blacklist_ok(name: str) -> bool:
     return bool(name) and name not in _DART_BUILTIN_TYPES
 
 
-def _collect_top_type_names(node, source: bytes) -> list[str]:
-    """Collect top-level type names from a type node, preserving foo.Bar quals.
+def _blank_comments(root, source: bytes) -> bytes:
+    """Return ``source`` with every comment blanked to spaces.
 
-    Does not flatten nested type_arguments (Bloc<Pair<A,B>, C> → Pair, C only).
+    Byte length and newlines are preserved, so node byte offsets and line
+    numbers computed against the result match the original source. The regex
+    heuristics run on this text so a commented-out ``emit(Loading())`` or
+    ``context.push('/x')`` no longer mints an edge (the regex extractor scanned
+    comment-stripped text too). String literals are kept: route paths live in
+    them.
     """
-    if node is None:
-        return []
-    names: list[str] = []
+    spans: list[tuple[int, int]] = []
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type in ("comment", "documentation_comment"):
+            spans.append((n.start_byte, n.end_byte))
+            continue
+        stack.extend(n.children)
+    if not spans:
+        return source
+    buf = bytearray(source)
+    for start, end in spans:
+        buf[start:end] = re.sub(rb"[^\n]", b" ", bytes(buf[start:end]))
+    return bytes(buf)
 
-    def walk_type(n) -> None:
-        if n is None:
-            return
-        if n.type == "type_arguments":
-            # Only direct type children of this argument list.
-            i = 0
-            children = [c for c in n.children if c.is_named or c.type == "."]
-            while i < len(children):
-                c = children[i]
-                if c.type == "type_identifier":
-                    parts = [_read_text(c, source)]
-                    j = i + 1
-                    while j + 1 < len(children) and children[j].type == "." and children[j + 1].type == "type_identifier":
-                        parts.append(_read_text(children[j + 1], source))
-                        j += 2
-                    names.append(".".join(parts))
-                    # Skip nested type_arguments belonging to this type.
-                    if j < len(children) and children[j].type == "type_arguments":
-                        j += 1
-                    i = j
-                    continue
-                if c.type == "type_arguments":
-                    i += 1
-                    continue
-                if c.is_named:
-                    walk_type(c)
-                i += 1
-            return
-        if n.type == "type_identifier":
-            # Lone identifier (no args) — handled by callers joining quals.
-            return
-        for c in n.children:
-            if c.is_named or c.type == ".":
-                if c.type == "type_arguments":
-                    walk_type(c)
-                elif c.type not in ("type_identifier", "."):
-                    walk_type(c)
 
-    if node.type == "type_arguments":
-        walk_type(node)
-        return names
+def _type_groups(children, start: int = 0) -> list[tuple[list, object | None]]:
+    """Read ``A, p.B<X>, C`` from a flat child list.
 
-    # Qualified / simple type: join type_identifier(.type_identifier)* then args.
-    children = list(node.children)
-    i = 0
-    while i < len(children):
+    Returns ``(type_identifier_nodes, type_arguments_node_or_None)`` for each
+    top-level type (``p.B`` is two type_identifier nodes), so a type's own
+    generic arguments are never reported as
+    extra supertypes (``implements Cmp<Foo>`` is Cmp, not Cmp and Foo). Stops
+    at the first child that cannot be part of the list (a body, another
+    clause).
+    """
+    groups: list[tuple[list, object | None]] = []
+    i = start
+    n = len(children)
+    while i < n:
         c = children[i]
         if c.type == "type_identifier":
-            parts = [_read_text(c, source)]
+            parts = [c]
             j = i + 1
-            while j + 1 < len(children) and children[j].type == "." and children[j + 1].type == "type_identifier":
-                parts.append(_read_text(children[j + 1], source))
+            while j + 1 < n and children[j].type == "." and children[j + 1].type == "type_identifier":
+                parts.append(children[j + 1])
                 j += 2
-            names.append(".".join(parts))
-            if j < len(children) and children[j].type == "type_arguments":
-                walk_type(children[j])
+            args = None
+            if j < n and children[j].type == "type_arguments":
+                args = children[j]
                 j += 1
+            groups.append((parts, args))
             i = j
             continue
-        if c.type == "type_arguments":
-            walk_type(c)
-        elif c.is_named:
-            walk_type(c)
-        i += 1
-    return names
+        if c.type in (",", "<", ">", "?", "nullable_type"):
+            i += 1
+            continue
+        if c.type in ("implements", "with", "extends", "on"):
+            i += 1
+            continue
+        break
+    return groups
 
 
-def _first_identifier(node, source: bytes) -> str | None:
-    if node is None:
-        return None
-    if node.type == "identifier":
-        return _read_text(node, source)
-    for c in node.children:
-        if c.type == "identifier":
-            return _read_text(c, source)
-        if c.is_named:
-            found = _first_identifier(c, source)
-            if found:
-                return found
-    return None
+def _decl_name_node(node):
+    """The name node of a type declaration (None for an anonymous extension)."""
+    if node.type == "type_alias":
+        kids = node.children
+        if any(c.type == "=" for c in kids):
+            # typedef Name<T> = Type;
+            return next((c for c in kids if c.type == "type_identifier"), None)
+        # Legacy function typedef: `typedef int Compare(Object a, Object b);`
+        # The name is the last type_identifier before the type parameters /
+        # parameter list; any earlier one is the return type.
+        last = None
+        for c in kids:
+            if c.type in ("formal_parameter_list", "type_parameters"):
+                break
+            if c.type == "type_identifier":
+                last = c
+        return last
+    return next((c for c in node.children if c.type == "identifier"), None)
+
+
+def _sig_name(sig, source: bytes) -> str | None:
+    idents = [c for c in sig.children if c.type == "identifier"]
+    return _read_text(idents[-1], source) if idents else None
+
+
+def _list_names(id_list, source: bytes) -> list:
+    """Identifier nodes declared by a field / variable declaration list."""
+    out = []
+    for ini in id_list.children:
+        if ini.type == "identifier":
+            out.append(ini)
+        elif ini.type in ("initialized_identifier", "static_final_declaration"):
+            ident = next((x for x in ini.children if x.type == "identifier"), None)
+            if ident is not None:
+                out.append(ident)
+    return out
+
+
+_ID_LISTS = ("initialized_identifier_list", "static_final_declaration_list", "identifier_list")
+_FACTORY_SIGNATURES = ("factory_constructor_signature", "redirecting_factory_constructor_signature")
+
+
+def _member_names(body, source: bytes) -> list[str]:
+    """Every member name a type body declares (for the id-collision census)."""
+    names: list[str | None] = []
+    for child in body.children:
+        if child.type not in ("method_signature", "declaration"):
+            continue
+        for c in child.children:
+            if c.type in _MEMBER_SIGNATURES:
+                names.append(_sig_name(c, source))
+            elif c.type in _FACTORY_SIGNATURES:
+                idents = [x for x in c.children if x.type == "identifier"]
+                if len(idents) >= 2:
+                    names.append(_read_text(idents[-1], source))
+            elif c.type in _ID_LISTS:
+                names.extend(_read_text(x, source) for x in _list_names(c, source))
+    return [n for n in names if n]
+
+
+def _top_level_names(root, source: bytes) -> list[str]:
+    """Every name declared at file scope (types, functions, variables)."""
+    names: list[str | None] = []
+    for child in root.children:
+        if child.type in _TYPE_DECLS:
+            n = _decl_name_node(child)
+            if n is not None:
+                names.append(_read_text(n, source))
+        elif child.type in _MEMBER_SIGNATURES:
+            names.append(_sig_name(child, source))
+        elif child.type in ("static_final_declaration_list", "initialized_identifier_list"):
+            names.extend(_read_text(x, source) for x in _list_names(child, source))
+    return [n for n in names if n]
+
+
+def _collision_groups(names, nid_of) -> dict[str, set[str]]:
+    """{plain id: names} for ids that two distinct names collapse into."""
+    groups: dict[str, set[str]] = {}
+    for name in names:
+        groups.setdefault(nid_of(name), set()).add(name)
+    return {nid: group for nid, group in groups.items() if len(group) >= 2}
 
 
 def _qualified_type_before(node, source: bytes) -> str | None:
@@ -139,9 +224,7 @@ def _qualified_type_before(node, source: bytes) -> str | None:
         idx = siblings.index(node)
     except ValueError:
         return None
-    parts: list[str] = []
     i = idx - 1
-    # Walk left over type_identifier and '.' 
     buf: list[str] = []
     while i >= 0:
         s = siblings[i]
@@ -149,10 +232,7 @@ def _qualified_type_before(node, source: bytes) -> str | None:
             buf.append(_read_text(s, source))
             i -= 1
             continue
-        if s.type == ".":
-            i -= 1
-            continue
-        if s.type in ("type_arguments",):
+        if s.type in (".", "type_arguments"):
             i -= 1
             continue
         break
@@ -162,16 +242,8 @@ def _qualified_type_before(node, source: bytes) -> str | None:
     return ".".join(buf)
 
 
-def _apply_flutter_heuristics(
-    body_text: str,
-    body_start_line: int,
-    owner_nid: str,
-    add_node,
-    add_edge,
-    *,
-    attribute_generic_lookups_to: str | None = None,
-) -> None:
-    """Bloc / Riverpod / navigation edges from body source text."""
+def _apply_flutter_heuristics(body_text: str, body_start_line: int, owner_nid: str, add_node, add_edge) -> None:
+    """Bloc / Riverpod / navigation edges from (comment-blanked) body source text."""
     if not body_text:
         return
 
@@ -263,20 +335,6 @@ def _apply_flutter_heuristics(
         add_node(route_nid, route_class, source_file=None, line=None)
         add_edge(owner_nid, route_nid, "navigates", line=_line_at(om.start(1)), context="route_object")
 
-    # Universal generic invocations → file-level type lookups (legacy contract).
-    if attribute_generic_lookups_to is not None:
-        generic_call_pattern = r"\b\w+<([a-zA-Z0-9_.]+(?:<[a-zA-Z0-9_.,\s<>]+>)?)\s*>\s*\("
-        for m in re.finditer(generic_call_pattern, body_text):
-            type_name = m.group(1).split(".")[-1].strip()
-            clean_name = type_name.split("<")[0].strip()
-            if _type_blacklist_ok(clean_name):
-                target_nid = _make_id(clean_name)
-                add_node(target_nid, clean_name, source_file=None, line=None)
-                add_edge(
-                    attribute_generic_lookups_to, target_nid, "references",
-                    line=_line_at(m.start(1)), context="type_lookup",
-                )
-
 
 def extract_dart(path: Path) -> dict:
     """Extract Dart/Flutter symbols via tree-sitter AST (+ Flutter body heuristics)."""
@@ -285,22 +343,38 @@ def extract_dart(path: Path) -> dict:
         from tree_sitter import Language, Parser
     except ImportError:
         return {"nodes": [], "edges": [], "error": "tree-sitter-dart not installed"}
+    # Lazy: graphify.extractors imports this module while it initialises.
+    from graphify.extractors.engine import _underscore_salted_nid
 
     try:
-        source = path.read_bytes()
-        language = Language(tsdart.language())
-        parser = Parser(language)
-        tree = parser.parse(source)
-        root = tree.root_node
+        source = _read_source_bytes(path)
+    except OSError:
+        return {"nodes": [], "edges": [], "error": f"cannot read {path}"}
+
+    try:
+        parser = Parser(Language(tsdart.language()))
+        root = parser.parse(source).root_node
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
+
+    # Same bytes with comments blanked: for the regex heuristics only. The AST
+    # walk and node text keep reading `source`.
+    clean = _blank_comments(root, source)
 
     stem = _file_stem(path)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
-    seen_ids: set[str] = set()
-    function_bodies: list[tuple[str, object, bool]] = []  # nid, body_node, is_top_level
+    node_by_id: dict[str, dict] = {}
+    seen_ids = node_by_id.keys()
+    # caller nid, body node. Calls inside closures and local functions are
+    # credited to the enclosing declaration, which is the graph node they run in.
+    function_bodies: list[tuple[str, object]] = []
+    # Call-resolution indexes (see the call pass at the end).
+    top_callables: dict[str, list[str]] = {}       # label -> top-level functions/types
+    class_members: dict[str, dict[str, str]] = {}  # type nid -> {member label: nid}
+    member_owner: dict[str, str] = {}              # member nid -> type nid
+    member_by_label: dict[str, list[str]] = {}     # label -> every member nid
 
     def add_node(
         nid: str,
@@ -309,17 +383,19 @@ def extract_dart(path: Path) -> dict:
         ftype: str = "code",
         source_file: str | None = str_path,
         line: int | None = None,
-    ) -> None:
-        if nid in seen_ids:
-            return
-        seen_ids.add(nid)
-        nodes.append({
+    ) -> bool:
+        if nid in node_by_id:
+            return False
+        node = {
             "id": nid,
             "label": label,
             "file_type": ftype,
             "source_file": source_file,
             "source_location": f"L{line}" if line is not None else None,
-        })
+        }
+        node_by_id[nid] = node
+        nodes.append(node)
+        return True
 
     def add_edge(
         src: str,
@@ -327,7 +403,6 @@ def extract_dart(path: Path) -> dict:
         relation: str,
         *,
         line: int | None = None,
-        confidence: str = "EXTRACTED",
         weight: float = 1.0,
         context: str | None = None,
     ) -> None:
@@ -335,8 +410,8 @@ def extract_dart(path: Path) -> dict:
             "source": src,
             "target": tgt,
             "relation": relation,
-            "confidence": confidence,
-            "confidence_score": 1.0 if confidence == "EXTRACTED" else 0.5,
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
             "source_file": str_path,
             "source_location": f"L{line}" if line is not None else None,
             "weight": weight,
@@ -347,45 +422,56 @@ def extract_dart(path: Path) -> dict:
 
     def ensure_external(name: str) -> str:
         nid = _make_id(name)
-        if nid not in seen_ids:
-            seen_ids.add(nid)
-            nodes.append({
-                "id": nid,
-                "label": name,
-                "file_type": "code",
-                "source_file": None,
-                "source_location": None,
-            })
+        add_node(nid, name, source_file=None)
         return nid
 
+    def register_member(type_nid: str, label: str, nid: str) -> None:
+        class_members.setdefault(type_nid, {}).setdefault(label, nid)
+        member_owner[nid] = type_nid
+        member_by_label.setdefault(label, []).append(nid)
+
     # --- part of redirect ---
+    # Every scanned file keeps its own file node. For a part file the symbols
+    # still belong to the library (file_nid); the part's node is linked from the
+    # library and to its symbols at the end of extraction.
+    own_nid = _make_id(str_path)
+    file_nid = own_nid
     is_part = False
-    file_nid = _make_id(str(path))
+    part_of_line: int | None = None
+    for top in root.children:
+        if top.type != "part_of_directive":
+            continue
+        uri = next((c for c in top.children if c.type == "uri"), None)
+        part_ref = _strip_quotes(_read_text(uri, source)) if uri is not None else ""
+        if part_ref.endswith(".dart"):
+            try:
+                parent_path = (path.parent / part_ref).resolve()
+                if parent_path.exists():
+                    stem = _file_stem(parent_path)
+                    file_nid = _make_id(str(parent_path))
+                    is_part = True
+                    part_of_line = _line_of(uri)
+            except Exception:
+                pass
+        break
 
-    def _find_part_of(node) -> str | None:
-        if node.type == "part_of_directive":
-            for c in node.children:
-                if c.type == "uri":
-                    return _strip_quotes(_read_text(c, source))
-        for c in node.children:
-            found = _find_part_of(c)
-            if found:
-                return found
-        return None
+    add_node(own_nid, path.name, source_file=str_path, line=None)
 
-    part_ref = _find_part_of(root)
-    if part_ref and part_ref.endswith(".dart"):
-        try:
-            parent_path = (path.parent / part_ref).resolve()
-            if parent_path.exists():
-                stem = _file_stem(parent_path)
-                file_nid = _make_id(str(parent_path))
-                is_part = True
-        except Exception:
-            pass
+    # `_make_id` drops `_` and `$` and lowercases, so freezed's `mixin _$AuthVm`
+    # and `class _AuthVm`, or a field `_items` and its getter `items`, collapse
+    # into one id and the second declaration vanished. Same rule as the
+    # Python / C# / JS extractors (#3302, #4415, #4475): a unique public name
+    # keeps the plain id, every other colliding name gets a salted one, so the
+    # result never depends on declaration order. The census is per scope: file
+    # scope here, each type body in handle_class_body.
+    _dart_private = ("_", "$")
+    top_groups = _collision_groups(_top_level_names(root, source), lambda n: _make_id(stem, n))
 
-    if not is_part:
-        add_node(file_nid, path.name, source_file=str_path, line=None)
+    def top_nid(name: str) -> str:
+        return _underscore_salted_nid(_make_id(stem, name), name, top_groups, _dart_private)
+
+    def member_nid(type_nid: str, name: str, groups: dict) -> str:
+        return _underscore_salted_nid(_make_id(type_nid, name), name, groups, _dart_private)
 
     def emit_annotation_edges(ann_node, target_nid: str, target_name: str, target_kind: str) -> None:
         name = None
@@ -412,86 +498,92 @@ def extract_dart(path: Path) -> dict:
             add_node(provider_nid, provider_name, ftype="concept", source_file=str_path, line=line)
             add_edge(target_nid, provider_nid, "defines", line=line, context="riverpod_provider")
 
+    def group_name(parts) -> str:
+        return ".".join(_read_text(p, source) for p in parts)
+
+    def emit_supertype(type_nid: str, parts, args, relation: str, line: int, *, with_arg_refs: bool) -> None:
+        name = group_name(parts)
+        last = name.split(".")[-1]
+        if relation != "inherits" and not (_type_blacklist_ok(last) or name == "Object"):
+            return
+        add_edge(type_nid, ensure_external(name), relation, line=line)
+        if with_arg_refs and args is not None:
+            # MyBloc extends Bloc<MyEvent, MyState> references MyEvent, MyState.
+            for arg_parts, _ in _type_groups(args.children):
+                arg = group_name(arg_parts)
+                if _type_blacklist_ok(arg.split(".")[-1]):
+                    add_edge(type_nid, ensure_external(arg), "references", line=line)
+
     def emit_heritage(type_nid: str, type_node, line: int) -> None:
-        """Process superclass / mixins / interfaces children of a type decl."""
+        """extends / with / implements / mixin `on` clauses of a type declaration."""
         for child in type_node.children:
             if child.type == "superclass":
-                # extends or on
-                relation = "inherits"
-                # Prefer joining leading type_identifiers.
-                parts: list[str] = []
-                saw_args = False
-                generic_names: list[str] = []
-                kids = list(child.children)
-                i = 0
-                while i < len(kids):
-                    c = kids[i]
-                    if c.type in ("extends", "on"):
-                        i += 1
-                        continue
-                    if c.type == "type_identifier" and not saw_args:
-                        parts.append(_read_text(c, source))
-                        i += 1
-                        continue
-                    if c.type == "." and not saw_args:
-                        i += 1
-                        continue
-                    if c.type == "type_arguments":
-                        saw_args = True
-                        generic_names = _collect_top_type_names(c, source)
-                        i += 1
-                        continue
+                kids = child.children
+                groups = _type_groups(kids)
+                if groups:
+                    parts, args = groups[0]
+                    emit_supertype(type_nid, parts, args, "inherits", line, with_arg_refs=True)
+                for c in kids:
                     if c.type == "mixins":
-                        break
-                    i += 1
-                if parts:
-                    base = ".".join(parts)
-                    base_nid = ensure_external(base)
-                    add_edge(type_nid, base_nid, relation, line=line)
-                    for gen in generic_names:
-                        gen_clean = gen.split("<")[0].strip()
-                        if _type_blacklist_ok(gen_clean.split(".")[-1]):
-                            # Use full gen for id if dotted, else simple.
-                            gen_nid = ensure_external(gen_clean)
-                            add_edge(type_nid, gen_nid, "references", line=line)
-                # mixins nested under superclass
-                for c in child.children:
-                    if c.type == "mixins":
-                        for mname in _collect_top_type_names(c, source):
-                            if _type_blacklist_ok(mname.split(".")[-1]):
-                                mnid = ensure_external(mname)
-                                add_edge(type_nid, mnid, "mixes_in", line=line)
+                        for parts, args in _type_groups(c.children):
+                            emit_supertype(type_nid, parts, args, "mixes_in", line, with_arg_refs=False)
             elif child.type == "mixins":
-                for mname in _collect_top_type_names(child, source):
-                    if _type_blacklist_ok(mname.split(".")[-1]):
-                        mnid = ensure_external(mname)
-                        add_edge(type_nid, mnid, "mixes_in", line=line)
+                for parts, args in _type_groups(child.children):
+                    emit_supertype(type_nid, parts, args, "mixes_in", line, with_arg_refs=False)
             elif child.type == "interfaces":
-                for iname in _collect_top_type_names(child, source):
-                    if _type_blacklist_ok(iname.split(".")[-1]) or iname == "Object":
-                        # Object is allowed for extension type implements Object
-                        inid = ensure_external(iname)
-                        add_edge(type_nid, inid, "implements", line=line)
+                for parts, args in _type_groups(child.children):
+                    emit_supertype(type_nid, parts, args, "implements", line, with_arg_refs=False)
 
-        # mixin_declaration uses bare `on Type` as siblings, not superclass wrapper
+        # A mixin's `on` clause is a bare sibling list and may name several
+        # superclass constraints (`mixin M on A, B<C> {}`); each one inherits.
         if type_node.type == "mixin_declaration":
-            kids = list(type_node.children)
+            kids = type_node.children
             for i, c in enumerate(kids):
-                if c.type == "on" and i + 1 < len(kids) and kids[i + 1].type == "type_identifier":
-                    # may be qualified
-                    parts = [_read_text(kids[i + 1], source)]
-                    j = i + 2
-                    while j + 1 < len(kids) and kids[j].type == "." and kids[j + 1].type == "type_identifier":
-                        parts.append(_read_text(kids[j + 1], source))
-                        j += 2
-                    base = ".".join(parts)
-                    base_nid = ensure_external(base)
-                    add_edge(type_nid, base_nid, "inherits", line=line)
+                if c.type == "on":
+                    for parts, args in _type_groups(kids, i + 1):
+                        emit_supertype(type_nid, parts, args, "inherits", line, with_arg_refs=True)
+                    break
 
-    def handle_class_body(body_node, class_nid: str, class_name: str) -> None:
+    def add_member(type_nid: str, groups: dict, fname: str, line: int, pending_annotations: list) -> str | None:
+        if not fname or fname in _METHOD_NAME_SKIP or re.match(r"^[A-Z]", fname):
+            return None
+        mnid = member_nid(type_nid, fname, groups)
+        if add_node(mnid, fname, line=line):
+            add_edge(type_nid, mnid, "defines", line=line)
+            # Also file -> defines, so label-based tools still see membership.
+            add_edge(file_nid, mnid, "defines", line=line)
+            register_member(type_nid, fname, mnid)
+        for ann in pending_annotations:
+            emit_annotation_edges(ann, mnid, fname, "function")
+        return mnid
+
+    def add_fields(type_nid: str, groups: dict, decl, id_list) -> None:
+        parts: list[str] = []
+        for c in decl.children:
+            if c is id_list:
+                break
+            if c.type == "type_identifier":
+                parts.append(_read_text(c, source))
+        var_type = ".".join(parts) if parts else None
+        for ident in _list_names(id_list, source):
+            vname = _read_text(ident, source)
+            if not vname or vname in _METHOD_NAME_SKIP:
+                continue
+            line = _line_of(ident)
+            vnid = member_nid(type_nid, vname, groups)
+            if add_node(vnid, vname, line=line):
+                add_edge(type_nid, vnid, "defines", line=line)
+                add_edge(file_nid, vnid, "defines", line=line)
+            if var_type:
+                clean_type = var_type.split(".")[-1]
+                if _type_blacklist_ok(clean_type):
+                    add_edge(file_nid, ensure_external(clean_type), "references", line=line, context="variable_type")
+
+    def handle_class_body(body_node, type_nid: str) -> None:
         if body_node is None:
             return
-        children = list(body_node.children)
+        groups = _collision_groups(_member_names(body_node, source), lambda n: _make_id(type_nid, n))
+        children = body_node.children
         i = 0
         pending_annotations: list = []
         while i < len(children):
@@ -502,171 +594,101 @@ def extract_dart(path: Path) -> dict:
                 continue
 
             if child.type == "declaration":
-                # field or constructor
-                ctor = None
-                for c in child.children:
-                    if c.type in (
-                        "constructor_signature",
-                        "constant_constructor_signature",
-                        "factory_constructor_signature",
-                        "redirecting_factory_constructor_signature",
-                    ):
-                        ctor = c
-                        break
-                if ctor is not None:
-                    # Skip primary constructors named after the class; keep factories.
-                    if ctor.type in ("factory_constructor_signature", "redirecting_factory_constructor_signature"):
-                        idents = [c for c in ctor.children if c.type == "identifier"]
-                        # factory MyService.fromJson → last identifier is fromJson
-                        if len(idents) >= 2:
-                            fname = _read_text(idents[-1], source)
-                        elif len(idents) == 1:
-                            fname = _read_text(idents[0], source)
-                        else:
-                            fname = None
-                        if fname and fname not in _METHOD_NAME_SKIP and not re.match(r"^[A-Z]", fname):
-                            line = _line_of(ctor)
-                            mnid = _make_id(stem, class_name, fname)
-                            add_node(mnid, fname, line=line)
-                            add_edge(class_nid, mnid, "defines", line=line)
-                            for ann in pending_annotations:
-                                emit_annotation_edges(ann, mnid, fname, "function")
-                    pending_annotations = []
-                    i += 1
-                    continue
-
-                # Field declaration
-                # Prefer last qualified type before identifier list
-                id_list = None
-                for c in child.children:
-                    if c.type in ("initialized_identifier_list",):
-                        id_list = c
-                if id_list is not None:
-                    # Collect type: type_identifiers before the list
-                    parts: list[str] = []
-                    for c in child.children:
-                        if c is id_list:
-                            break
-                        if c.type == "type_identifier":
-                            parts.append(_read_text(c, source))
-                        elif c.type == ".":
-                            continue
-                        elif c.type == "type_arguments":
-                            continue
-                    var_type = ".".join(parts) if parts else None
-                    for ini in id_list.children:
-                        if ini.type != "initialized_identifier":
-                            continue
-                        ident = next((x for x in ini.children if x.type == "identifier"), None)
-                        if not ident:
-                            continue
-                        vname = _read_text(ident, source)
-                        if not vname or vname in _METHOD_NAME_SKIP:
-                            continue
-                        line = _line_of(ident)
-                        vnid = _make_id(stem, class_name, vname)
-                        add_node(vnid, vname, line=line)
-                        add_edge(class_nid, vnid, "defines", line=line)
-                        # Also file-level define edge for legacy field discovery
-                        add_edge(file_nid, vnid, "defines", line=line)
-                        if var_type:
-                            clean = var_type.split("<")[0].split(".")[-1].strip()
-                            if _type_blacklist_ok(clean):
-                                tid = ensure_external(clean)
-                                add_edge(
-                                    file_nid, tid, "references",
-                                    line=line, context="variable_type",
-                                )
+                # Field, bodiless constructor, or abstract/external member.
+                sig = next((c for c in child.children if c.type in _CTOR_SIGNATURES or c.type in _MEMBER_SIGNATURES), None)
+                if sig is not None and sig.type in ("factory_constructor_signature", "redirecting_factory_constructor_signature"):
+                    idents = [c for c in sig.children if c.type == "identifier"]
+                    # factory MyService.fromJson -> the last identifier is fromJson
+                    if len(idents) >= 2:
+                        add_member(type_nid, groups, _read_text(idents[-1], source), _line_of(sig), pending_annotations)
+                elif sig is not None and sig.type in _MEMBER_SIGNATURES:
+                    # `Future<bool> openLogin();` in an interface / abstract class.
+                    idents = [c for c in sig.children if c.type == "identifier"]
+                    if idents:
+                        add_member(type_nid, groups, _read_text(idents[-1], source), _line_of(sig), pending_annotations)
+                elif sig is None:
+                    id_list = next(
+                        (c for c in child.children
+                         if c.type in ("initialized_identifier_list", "static_final_declaration_list", "identifier_list")),
+                        None,
+                    )
+                    if id_list is not None:
+                        add_fields(type_nid, groups, child, id_list)
                 pending_annotations = []
                 i += 1
                 continue
 
             if child.type == "method_signature":
                 body = children[i + 1] if i + 1 < len(children) and children[i + 1].type == "function_body" else None
-                sig = child
                 fname = None
-                for c in sig.children:
-                    if c.type == "factory_constructor_signature":
+                is_ctor = False
+                for c in child.children:
+                    if c.type in ("factory_constructor_signature", "redirecting_factory_constructor_signature"):
+                        # `factory A.fromJson()` is a member node; an unnamed
+                        # `factory A()` is credited to the type like a constructor.
+                        is_ctor = True
                         idents = [x for x in c.children if x.type == "identifier"]
                         if len(idents) >= 2:
                             fname = _read_text(idents[-1], source)
-                        elif idents:
-                            fname = _read_text(idents[0], source)
-                    elif c.type in ("function_signature", "getter_signature", "setter_signature", "method_signature"):
-                        # nested
-                        for x in c.children:
-                            if x.type == "identifier":
-                                # last identifier before params tends to be the name
-                                pass
+                    elif c.type in ("constructor_signature", "constant_constructor_signature"):
+                        is_ctor = True
+                    elif c.type in _MEMBER_SIGNATURES:
                         idents = [x for x in c.children if x.type == "identifier"]
                         if idents:
                             fname = _read_text(idents[-1], source)
-                    elif c.type == "identifier":
-                        fname = _read_text(c, source)
-
-                # function_signature directly under method_signature
-                fs = next((c for c in sig.children if c.type == "function_signature"), None)
-                if fs is not None:
-                    idents = [x for x in fs.children if x.type == "identifier"]
-                    if idents:
-                        fname = _read_text(idents[-1], source)
-                gs = next((c for c in sig.children if c.type == "getter_signature"), None)
-                if gs is not None:
-                    idents = [x for x in gs.children if x.type == "identifier"]
-                    if idents:
-                        fname = _read_text(idents[-1], source)
-
-                if fname and fname not in _METHOD_NAME_SKIP and not re.match(r"^[A-Z]", fname):
-                    line = _line_of(sig)
-                    mnid = _make_id(stem, class_name, fname)
-                    add_node(mnid, fname, line=line)
-                    add_edge(class_nid, mnid, "defines", line=line)
-                    # Legacy: also file→defines so label-based tools still see membership weakly
-                    add_edge(file_nid, mnid, "defines", line=line)
-                    for ann in pending_annotations:
-                        emit_annotation_edges(ann, mnid, fname, "function")
-                    if body is not None:
-                        function_bodies.append((mnid, body, False))
-                        body_text = _read_text(body, source)
-                        _apply_flutter_heuristics(
-                            body_text, _line_of(body), mnid, add_node, add_edge,
-                            attribute_generic_lookups_to=file_nid,
-                        )
+                owner = add_member(type_nid, groups, fname, _line_of(child), pending_annotations) if fname else None
+                if owner is None and is_ctor:
+                    # A generative constructor is not its own node; its body
+                    # (Bloc `on<Event>` registrations, init calls) runs in the type.
+                    owner = type_nid
+                if body is not None and owner is not None:
+                    function_bodies.append((owner, body))
+                    if owner != type_nid:
+                        _apply_flutter_heuristics(_read_text(body, clean), _line_of(body), owner, add_node, add_edge)
                 pending_annotations = []
-                if body is not None:
-                    i += 2
-                else:
-                    i += 1
+                i += 2 if body is not None else 1
                 continue
 
             pending_annotations = []
             i += 1
 
-        # Whole-class body heuristics (Bloc ctor registrations live in constructors)
-        body_text = _read_text(body_node, source)
-        _apply_flutter_heuristics(
-            body_text, _line_of(body_node), class_nid, add_node, add_edge,
-            attribute_generic_lookups_to=file_nid,
-        )
+        # Whole-body heuristics on the type (Bloc ctor registrations live in constructors).
+        _apply_flutter_heuristics(_read_text(body_node, clean), _line_of(body_node), type_nid, add_node, add_edge)
 
-    def handle_type_decl(node) -> None:
-        name = None
-        name_node = None
-        for c in node.children:
-            if c.type == "identifier":
-                name = _read_text(c, source)
-                name_node = c
-                break
-            if c.type == "type_identifier" and node.type == "type_alias":
-                name = _read_text(c, source)
-                name_node = c
-                break
-        if not name:
-            return
-        line = _line_of(name_node or node)
-        type_nid = _make_id(stem, name)
-        add_node(type_nid, name, line=line)
-        add_edge(file_nid, type_nid, "defines", line=line)
+    def extension_target(node):
+        kids = node.children
+        for i, c in enumerate(kids):
+            if c.type == "on":
+                groups = _type_groups(kids, i + 1)
+                if groups:
+                    parts, _ = groups[0]
+                    return group_name(parts), parts[0]
+                return None
+        return None
+
+    def handle_type_decl(node) -> tuple[str, str] | None:
+        ext = extension_target(node) if node.type == "extension_declaration" else None
+        name_node = _decl_name_node(node)
+        if name_node is not None:
+            name = label = _read_text(name_node, source)
+            line = _line_of(name_node)
+            type_nid = top_nid(name)
+        elif ext is not None:
+            # Anonymous `extension on T { ... }`.
+            name = f"{stem}_anonymous_extension"
+            label = f"Extension on {ext[0]}"
+            line = _line_of(ext[1])
+            type_nid = _make_id(stem, name)
+            if type_nid in seen_ids:
+                name = f"{stem}_anonymous_extension_{ext[0]}"
+                type_nid = _make_id(stem, name)
+        else:
+            return None
+
+        if add_node(type_nid, label, line=line):
+            add_edge(file_nid, type_nid, "defines", line=line)
+        if node.type != "type_alias":
+            top_callables.setdefault(label, []).append(type_nid)
 
         for c in node.children:
             if c.type == "annotation":
@@ -674,41 +696,25 @@ def extract_dart(path: Path) -> dict:
 
         emit_heritage(type_nid, node, line)
 
-        if node.type == "type_alias":
-            # typedef JsonMap = Map<...>;
-            type_ids = [c for c in node.children if c.type == "type_identifier"]
-            if len(type_ids) >= 2:
-                target = _read_text(type_ids[1], source)
+        if node.type == "type_alias" and any(c.type == "=" for c in node.children):
+            # typedef JsonMap = p.Map<...>; references the aliased named type.
+            # A function-type alias (`= R Function(int)`) nests its return type
+            # under function_type, so it references nothing here.
+            kids = node.children
+            eq = next(i for i, c in enumerate(kids) if c.type == "=")
+            groups = _type_groups(kids, eq + 1)
+            if groups:
+                target = group_name(groups[0][0]).split(".")[-1]
                 if _type_blacklist_ok(target):
-                    tid = ensure_external(target)
-                    add_edge(type_nid, tid, "references", line=line, context="typedef")
+                    add_edge(type_nid, ensure_external(target), "references", line=line, context="typedef")
 
-        body = None
-        for c in node.children:
-            if c.type in ("class_body", "enum_body", "extension_body"):
-                body = c
-                break
-        if body is not None and node.type != "enum_declaration":
-            handle_class_body(body, type_nid, name)
+        body = next((c for c in node.children if c.type in ("class_body", "enum_body", "extension_body")), None)
+        if body is not None:
+            handle_class_body(body, type_nid)
 
-        if node.type == "extension_declaration":
-            # extension X on Target
-            kids = list(node.children)
-            for i, c in enumerate(kids):
-                if c.type == "on" and i + 1 < len(kids):
-                    parts = []
-                    j = i + 1
-                    while j < len(kids) and kids[j].type in ("type_identifier", "."):
-                        if kids[j].type == "type_identifier":
-                            parts.append(_read_text(kids[j], source))
-                        j += 1
-                        if j < len(kids) and kids[j].type == "type_arguments":
-                            break
-                    if parts:
-                        target = ".".join(parts)
-                        tid = ensure_external(target)
-                        add_edge(type_nid, tid, "extends", line=line)
-                    break
+        if ext is not None:
+            add_edge(type_nid, ensure_external(ext[0]), "extends", line=line)
+        return type_nid, name
 
     def handle_top_function(sig_node, body_node, pending_annotations: list) -> None:
         idents = [c for c in sig_node.children if c.type == "identifier"]
@@ -718,49 +724,46 @@ def extract_dart(path: Path) -> dict:
         if not fname or fname in _METHOD_NAME_SKIP or re.match(r"^[A-Z]", fname):
             return
         line = _line_of(idents[-1])
-        fnid = _make_id(stem, fname)
-        add_node(fnid, fname, line=line)
-        add_edge(file_nid, fnid, "defines", line=line)
+        fnid = top_nid(fname)
+        if add_node(fnid, fname, line=line):
+            add_edge(file_nid, fnid, "defines", line=line)
+            top_callables.setdefault(fname, []).append(fnid)
         for ann in pending_annotations:
             emit_annotation_edges(ann, fnid, fname, "function")
         if body_node is not None:
-            function_bodies.append((fnid, body_node, True))
-            body_text = _read_text(body_node, source)
-            _apply_flutter_heuristics(
-                body_text, _line_of(body_node), fnid, add_node, add_edge,
-                attribute_generic_lookups_to=file_nid,
-            )
+            function_bodies.append((fnid, body_node))
+            _apply_flutter_heuristics(_read_text(body_node, clean), _line_of(body_node), fnid, add_node, add_edge)
 
     def handle_import_export(node) -> None:
-        is_export = any(c.type == "library_export" for c in node.children)
-        uri = None
-
-        def find_uri(n) -> str | None:
-            if n.type == "uri" or n.type == "configurable_uri":
-                text = _strip_quotes(_read_text(n, source))
-                # configurable_uri wraps uri
-                if n.type == "configurable_uri":
-                    for c in n.children:
-                        if c.type == "uri":
-                            return _strip_quotes(_read_text(c, source))
-                return text
-            for c in n.children:
-                found = find_uri(c)
-                if found:
-                    return found
-            return None
-
-        uri = find_uri(node)
-        if not uri:
-            return
-        line = _line_of(node)
-        tgt = ensure_external(uri)
-        # ensure label is full uri
-        for n in nodes:
-            if n["id"] == tgt:
-                n["label"] = uri
+        relation = "exports" if any(c.type == "library_export" for c in node.children) else "imports"
+        uris: list[tuple[object, str | None]] = []
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if n.type == "configurable_uri":
+                # `import 'x_stub.dart' if (dart.library.io) 'x_io.dart';` — the
+                # default URI keeps its plain edge; every platform branch is
+                # emitted too, tagged conditional_uri. A string inside the
+                # condition (`== 'prod'`) is not a URI.
+                for c in n.children:
+                    if c.type == "uri":
+                        uris.append((c, None))
+                    elif c.type == "configuration_uri":
+                        u = next((x for x in c.children if x.type == "uri"), None)
+                        if u is not None:
+                            uris.append((u, "conditional_uri"))
                 break
-        add_edge(file_nid, tgt, "exports" if is_export else "imports", line=line)
+            if n.type == "uri":
+                uris.append((n, None))
+                break
+            stack.extend(reversed(n.children))
+        for uri_node, context in uris:
+            uri = _strip_quotes(_read_text(uri_node, source))
+            if not uri:
+                continue
+            tgt = ensure_external(uri)
+            node_by_id[tgt]["label"] = uri
+            add_edge(file_nid, tgt, relation, line=_line_of(uri_node), context=context)
 
     def handle_top_level_vars(program) -> None:
         """Scan program children for top-level variable declarations."""
@@ -781,9 +784,9 @@ def extract_dart(path: Path) -> dict:
                     if not vname or vname in _METHOD_NAME_SKIP:
                         continue
                     line = _line_of(ident)
-                    vnid = _make_id(stem, vname)
-                    add_node(vnid, vname, line=line)
-                    add_edge(file_nid, vnid, "defines", line=line)
+                    vnid = top_nid(vname)
+                    if add_node(vnid, vname, line=line):
+                        add_edge(file_nid, vnid, "defines", line=line)
                 i += 1
                 continue
 
@@ -802,58 +805,39 @@ def extract_dart(path: Path) -> dict:
                     if re.match(r"^[A-Z]", vname):
                         continue
                     line = _line_of(ident)
-                    vnid = _make_id(stem, vname)
-                    add_node(vnid, vname, line=line)
-                    add_edge(file_nid, vnid, "defines", line=line)
-                    # variable type from preceding siblings
+                    vnid = top_nid(vname)
+                    if add_node(vnid, vname, line=line):
+                        add_edge(file_nid, vnid, "defines", line=line)
                     var_type = _qualified_type_before(c, source)
                     if var_type:
-                        clean = var_type.split(".")[-1]
-                        if _type_blacklist_ok(clean):
-                            tid = ensure_external(clean)
+                        clean_type = var_type.split(".")[-1]
+                        if _type_blacklist_ok(clean_type):
                             add_edge(
-                                file_nid, tid, "references",
+                                file_nid, ensure_external(clean_type), "references",
                                 line=line, context="variable_type",
                             )
                 i += 1
                 continue
 
-            # Pattern: ERROR(var) + record_type (recA, recB) 
-            if c.type == "ERROR" or (c.type == "inferred_type"):
-                # look ahead for record_type with lowercase field names
+            # Pattern: ERROR(var) + record_type (recA, recB)
+            if c.type in ("ERROR", "inferred_type"):
                 j = i + 1
                 while j < len(children) and children[j].type in ("ERROR", "inferred_type"):
                     j += 1
                 if j < len(children) and children[j].type == "record_type":
-                    rt = children[j]
-                    for field in rt.children:
+                    for field in children[j].children:
                         if field.type != "record_type_field":
                             continue
-                        # Prefer identifier children (pattern binds); else type_identifier if lowercase
                         idents = [x for x in field.children if x.type == "identifier"]
-                        if idents:
-                            for ident in idents:
-                                vname = _read_text(ident, source)
-                                if vname and re.match(r"^[a-z_]\w*$", vname):
-                                    line = _line_of(ident)
-                                    vnid = _make_id(stem, vname)
-                                    add_node(vnid, vname, line=line)
+                        if not idents:
+                            idents = [x for x in field.children if x.type == "type_identifier"]
+                        for ident in idents:
+                            vname = _read_text(ident, source)
+                            if vname and re.match(r"^[a-z_]\w*$", vname):
+                                line = _line_of(ident)
+                                vnid = top_nid(vname)
+                                if add_node(vnid, vname, line=line):
                                     add_edge(file_nid, vnid, "defines", line=line)
-                        else:
-                            for ti in field.children:
-                                if ti.type == "type_identifier":
-                                    vname = _read_text(ti, source)
-                                    if vname and re.match(r"^[a-z_]\w*$", vname):
-                                        line = _line_of(ti)
-                                        vnid = _make_id(stem, vname)
-                                        add_node(vnid, vname, line=line)
-                                        add_edge(file_nid, vnid, "defines", line=line)
-                i += 1
-                continue
-
-            if c.type == "record_type":
-                # Standalone record_type after var ERROR already handled; also
-                # `final (int, String) typedRecord` has record_type then static_final list.
                 i += 1
                 continue
 
@@ -861,24 +845,16 @@ def extract_dart(path: Path) -> dict:
 
         # Regex supplement for object-pattern destructuring the grammar mishandles:
         # var User(name: myVar, age: myAge) = user;
-        src_text = source.decode("utf-8", errors="replace")
-        for m in re.finditer(
-            r"^\s*(?:var|final|const)\s+[A-Z]\w*\(([^)]+)\)\s*=",
-            src_text,
-            re.MULTILINE,
-        ):
-            inner = m.group(1)
-            for part in inner.split(","):
+        src_text = clean.decode("utf-8", errors="replace")
+        for m in re.finditer(r"^\s*(?:var|final|const)\s+[A-Z]\w*\(([^)]+)\)\s*=", src_text, re.MULTILINE):
+            for part in m.group(1).split(","):
                 part = part.strip()
-                if ":" in part:
-                    name = part.split(":")[-1].strip()
-                else:
-                    name = part
+                name = part.split(":")[-1].strip() if ":" in part else part
                 if re.match(r"^[a-z_]\w*$", name):
                     line = src_text[: m.start()].count("\n") + 1
-                    vnid = _make_id(stem, name)
-                    add_node(vnid, name, line=line)
-                    add_edge(file_nid, vnid, "defines", line=line)
+                    vnid = top_nid(name)
+                    if add_node(vnid, name, line=line):
+                        add_edge(file_nid, vnid, "defines", line=line)
 
     # --- walk program ---
     pending_annotations: list = []
@@ -888,42 +864,24 @@ def extract_dart(path: Path) -> dict:
         child = children[i]
 
         if child.type == "annotation":
-            # May belong to next class/function; peek ahead
+            # Belongs to the next class/function.
             pending_annotations.append(child)
             i += 1
             continue
 
-        if child.type in (
-            "class_definition",
-            "mixin_declaration",
-            "enum_declaration",
-            "extension_declaration",
-            "extension_type_declaration",
-            "type_alias",
-        ):
-            # Attach pending annotations into the node walk (also on the node itself)
-            handle_type_decl(child)
-            # If annotations were siblings before the decl, emit them now
-            name = None
-            for c in child.children:
-                if c.type == "identifier":
-                    name = _read_text(c, source)
-                    break
-                if c.type == "type_identifier" and child.type == "type_alias":
-                    name = _read_text(c, source)
-                    break
-            if name and pending_annotations:
-                type_nid = _make_id(stem, name)
+        if child.type in _TYPE_DECLS:
+            decl = handle_type_decl(child)
+            if decl is not None:
+                type_nid, name = decl
                 for ann in pending_annotations:
-                    # Avoid double-emit if already child of class_definition
-                    if ann.parent is child:
-                        continue
-                    emit_annotation_edges(ann, type_nid, name, "class")
+                    if ann.parent is not child:  # children were emitted already
+                        emit_annotation_edges(ann, type_nid, name, "class")
             pending_annotations = []
             i += 1
             continue
 
-        if child.type == "function_signature":
+        if child.type in _MEMBER_SIGNATURES:
+            # Top-level function, getter or setter.
             body = children[i + 1] if i + 1 < len(children) and children[i + 1].type == "function_body" else None
             handle_top_function(child, body, pending_annotations)
             pending_annotations = []
@@ -932,12 +890,6 @@ def extract_dart(path: Path) -> dict:
 
         if child.type == "import_or_export":
             handle_import_export(child)
-            pending_annotations = []
-            i += 1
-            continue
-
-        if child.type in ("library_import", "library_export"):
-            # sometimes not wrapped
             pending_annotations = []
             i += 1
             continue
@@ -959,99 +911,127 @@ def extract_dart(path: Path) -> dict:
 
     handle_top_level_vars(root)
 
-    # File-level generic type lookups across whole source (matches regex contract)
-    src_text = source.decode("utf-8", errors="replace")
-    # Skip comments roughly for lookups? Regex used cleaned source; for type_lookup
-    # false positives in comments are rare. Use full text for parity with tests.
+    # File-level generic type lookups (`get<AuthService>()`), once per call site,
+    # over comment-blanked text.
+    src_text = clean.decode("utf-8", errors="replace")
     generic_call_pattern = r"\b\w+<([a-zA-Z0-9_.]+(?:<[a-zA-Z0-9_.,\s<>]+>)?)\s*>\s*\("
     for m in re.finditer(generic_call_pattern, src_text):
         type_name = m.group(1).split(".")[-1].strip()
         clean_name = type_name.split("<")[0].strip()
         if _type_blacklist_ok(clean_name):
-            target_nid = _make_id(clean_name)
-            ensure_external(clean_name)
-            # Fix label to clean_name
-            for n in nodes:
-                if n["id"] == target_nid:
-                    n["label"] = clean_name
-                    break
+            target_nid = ensure_external(clean_name)
+            node_by_id[target_nid]["label"] = clean_name
             line = src_text[: m.start(1)].count("\n") + 1
             add_edge(file_nid, target_nid, "references", line=line, context="type_lookup")
 
-    # Call-graph second pass
-    label_to_nid: dict[str, str] = {}
-    for n in nodes:
-        if n.get("source_file") is None:
-            continue
-        label_to_nid[n["label"]] = n["id"]
-
+    # --- call-graph second pass ---
+    # A call binds only when its target is unambiguous in this file:
+    #   * a bare `foo()` / `this.foo()` inside a member prefers the caller's
+    #     own type's member `foo` (implicit `this`);
+    #   * otherwise a bare call binds to a unique top-level function or type
+    #     (`Greeter(...)` is a constructor call);
+    #   * a member call `x.foo()` binds to the one member named `foo` in this
+    #     file. With two candidates (a StatefulWidget and its State both
+    #     declaring `build`) nothing is emitted: a wrong EXTRACTED edge is
+    #     worse than a missing one.
+    # Unknown callees become raw_calls. They stay flagged as member calls so
+    # the corpus-wide bare-name resolver leaves them alone, as before.
     seen_call_pairs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []
 
-    def _has_argument_part(n) -> bool:
-        if n.type == "argument_part":
-            return True
-        return any(_has_argument_part(c) for c in n.children)
+    def resolve(callee: str, caller_nid: str, is_member: bool, on_this: bool) -> tuple[str | None, bool]:
+        """Return (target nid or None, known) where known=False means no local candidate."""
+        owner = member_owner.get(caller_nid) or (caller_nid if caller_nid in class_members else None)
+        if (not is_member or on_this) and owner is not None:
+            own = class_members.get(owner, {}).get(callee)
+            if own is not None:
+                return own, True
+        if not is_member:
+            cands = top_callables.get(callee, [])
+            if len(cands) == 1:
+                return cands[0], True
+            if cands:
+                return None, True
+            if owner is None:
+                # Top-level code cannot call a member without a receiver.
+                return None, bool(member_by_label.get(callee))
+        # A member call, or a bare call inside a member that its own type does
+        # not declare (inherited from a same-file supertype).
+        cands = member_by_label.get(callee, [])
+        if len(cands) == 1:
+            return cands[0], True
+        return None, bool(cands)
 
-    def _emit_call(callee: str, call_node, caller_nid: str) -> None:
+    def emit_call(callee: str, call_node, caller_nid: str, is_member: bool, on_this: bool) -> None:
         if not callee or callee in _LANGUAGE_BUILTIN_GLOBALS or callee in _METHOD_NAME_SKIP:
             return
-        tgt = label_to_nid.get(callee)
-        if tgt and tgt != caller_nid:
+        tgt, known = resolve(callee, caller_nid, is_member, on_this)
+        line = _line_of(call_node)
+        if tgt is not None:
+            if tgt == caller_nid:
+                return
             pair = (caller_nid, tgt)
-            if pair not in seen_call_pairs:
-                seen_call_pairs.add(pair)
-                line = _line_of(call_node)
-                edges.append({
-                    "source": caller_nid,
-                    "target": tgt,
-                    "relation": "calls",
-                    "context": "call",
-                    "confidence": "EXTRACTED",
-                    "confidence_score": 1.0,
-                    "source_file": str_path,
-                    "source_location": f"L{line}",
-                    "weight": 1.0,
-                })
-        elif callee:
+            if pair in seen_call_pairs:
+                return
+            seen_call_pairs.add(pair)
+            edges.append({
+                "source": caller_nid,
+                "target": tgt,
+                "relation": "calls",
+                "context": "call",
+                "confidence": "EXTRACTED",
+                "confidence_score": 1.0,
+                "source_file": str_path,
+                "source_location": f"L{line}",
+                "weight": 1.0,
+            })
+        elif not known:
             raw_calls.append({
                 "caller_nid": caller_nid,
                 "callee": callee,
                 "is_member_call": True,
                 "language": "dart",
                 "source_file": str_path,
-                "source_location": f"L{_line_of(call_node)}",
+                "source_location": f"L{line}",
             })
 
-    def walk_calls(node, caller_nid: str) -> None:
-        # Dart calls are identifier/selector chains ending in argument_part,
-        # appearing under expression_statement, return_statement, etc.
-        if node.type in ("expression_statement", "return_statement"):
-            selectors = [c for c in node.children if c.type == "selector"]
-            idents = [c for c in node.children if c.type == "identifier"]
-            if selectors and _has_argument_part(selectors[-1]):
-                callee = None
-                if len(selectors) >= 2:
-                    prev = selectors[-2]
-                    mid = next((c for c in prev.children if c.type == "identifier"), None)
-                    if mid is not None:
-                        callee = _read_text(mid, source)
-                    else:
-                        for c in prev.children:
-                            found = _first_identifier(c, source)
-                            if found:
-                                callee = found
-                                break
-                elif idents:
-                    callee = _read_text(idents[0], source)
-                _emit_call(callee, node, caller_nid)
+    def walk_calls(body_node, caller_nid: str) -> None:
+        # The grammar flattens a call chain into siblings: `a.b.c(1)` is
+        # identifier(a) selector(.b) selector(.c) selector(argument_part). A
+        # selector whose first child is argument_part is a call of whatever
+        # precedes it: an identifier (bare call) or a `.name` / `?.name`
+        # selector (member call). This finds calls in every position:
+        # statements, initializers, conditions, arguments, arrow bodies,
+        # closures and local functions.
+        stack = [body_node]
+        while stack:
+            n = stack.pop()
+            kids = n.children
+            for k, c in enumerate(kids):
+                if k and c.type == "selector" and c.named_child_count and c.named_children[0].type == "argument_part":
+                    prev = kids[k - 1]
+                    if prev.type == "identifier":
+                        emit_call(_read_text(prev, source), prev, caller_nid, False, False)
+                    elif prev.type == "selector" and prev.named_child_count:
+                        sel = prev.named_children[0]
+                        if sel.type in ("unconditional_assignable_selector", "conditional_assignable_selector"):
+                            ident = next((x for x in sel.children if x.type == "identifier"), None)
+                            if ident is not None:
+                                on_this = k == 2 and kids[0].type == "this"
+                                emit_call(_read_text(ident, source), ident, caller_nid, True, on_this)
+                stack.append(c)
 
-        for child in node.children:
-            if child.type in ("function_signature", "function_expression", "class_definition"):
-                continue
-            walk_calls(child, caller_nid)
-
-    for caller_nid, body_node, _top in function_bodies:
+    for caller_nid, body_node in function_bodies:
         walk_calls(body_node, caller_nid)
+
+    if is_part:
+        # The library includes this part; the part physically contains the
+        # declarations the library defines from it. Ids stay in the library's
+        # namespace, so the library is not split in two.
+        part_edges = [{**e, "source": own_nid, "relation": "contains"}
+                      for e in edges
+                      if e["source"] == file_nid and e["relation"] == "defines"]
+        add_edge(file_nid, own_nid, "includes", line=part_of_line)
+        edges.extend(part_edges)
 
     return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
